@@ -1,8 +1,28 @@
-# Uncomment this line to define a global platform for your project
-# platform :ios, '11.0'
+gem 'cocoapods', '1.12.1'
+
+platform :ios, '13.0'
+use_frameworks!
+inhibit_all_warnings!
+
+install! 'cocoapods',
+    :incremental_installation => true,
+    :generate_multiple_pod_projects => true,
+    :warn_for_multiple_pod_sources => false
+
+source 'git@code.byted.org:iOS_Library/lark_source_repo.git'
+source 'git@code.byted.org:ee/pods_specs.git'
+source 'git@code.byted.org:iOS_Library/privatethird_binary_repo.git'
+source 'git@code.byted.org:iOS_Library/privatethird_source_repo.git'
+source 'git@code.byted.org:iOS_Library/toutiao_source_repo.git'
+source 'git@code.byted.org:iOS_Library/publicthird_binary_repo.git'
+source 'git@code.byted.org:iOS_Library/publicthird_source_repo.git'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+require 'bd_pod_extentions'
+
+useBusDownload!
 
 project 'Runner', {
   'Debug' => :debug,
@@ -30,12 +50,214 @@ flutter_ios_podfile_setup
 target 'Runner' do
   use_frameworks!
   use_modular_headers!
-
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
 end
 
+# 为了修复 llvm module 内引用非 module 头文件的问题
+# 该名单下的 module 都会添加 CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES = true
+fix_modular_include ||= Set.new %w[
+  TTVideoEngine
+  TTPlayerSDK
+  BDABTestSDK
+  Heimdallr
+  TTNetworkManager
+  TTVideoEditor
+  bd_vessel
+  xg_base_video_player
+]
+
+# 为跨模块通过 "" 方式引用的 module 添加到 SYSTEM_HEADER_SEARCH_PATHS，防止编译不过
+should_fix_include_headers = {
+  "Heimdallr" => ['BDAlogProtocol', 'TTMacroManager', 'BDALog', 'SSZipArchive', 'Stinger'],
+  "TTVideoLive" => ['TTPlayerSDK'],
+  "TTVideoEngine" => ['MDLMediaDataLoader'],
+}
+
+# 需要强制添加 framework 依赖路径的 patch，但目前针对 generate_multiple_pod_projects 开启的情况不太好处理
+need_append_framework_dependency = {
+#  "xg_base_video_player" => ['TTVideoEngine'],
+}
+
+# 一些包含 C/C++ 文件的模块如果全部强制 Public 出去可能会有问题，这里维护一个白名单
+no_need_public_hook_modules = Set[
+  "MMKVCore"
+]
+
+pre_install do |installer|
+  # use_frameworks! 全部打成 Static Framework
+  force_use_static_framwork installer, except: []
+
+  # pod_targets_by_name.class = [Hash{String => Pod::PodTarget}]
+  pod_targets_by_name = installer.pod_targets.group_by(&:pod_name)
+  header_search_paths_of_pods = lambda do |pod_target|
+    return unless config = should_fix_include_headers[pod_target.name]
+    # use true to represent all dependency
+    included_targets = case config
+                       when true then pod_target.recursive_dependent_targets
+                       when Hash then
+                         pod_targets_by_name.values_at(*config[:recursive]).compact.flatten(1)
+                           .flat_map {|pt| [pt] + pt.recursive_dependent_targets}
+                           .uniq
+                       when Array then
+                         pod_targets_by_name.values_at(*config).compact.flatten(1)
+                       else
+                         raise "unsupported"
+                       end
+    return nil if included_targets.empty?
+
+    pt_build_settings = lambda do |pod_target|
+      pod_target.build_settings[:release]
+    end
+
+    headers = []
+    # @param pt [Pod::PodTarget]
+    included_targets.each do |pt|
+      if pt.requires_frameworks? && pt.should_build?
+        headers.push pt_build_settings[pt].framework_header_search_path
+      else
+        # the above code use direct include header, not <module/header.h>
+        headers.push "${PODS_ROOT}/Headers/Public"
+        headers.push "${PODS_ROOT}/Headers/Public/#{pt.pod_name}"
+        # append vendored frameworks header
+        headers.concat(pt_build_settings[pt].file_accessors.flat_map(&:vendored_frameworks).map { |f|
+          File.join '${PODS_ROOT}', f.relative_path_from(pt.sandbox.root), "Headers"
+        })
+      end
+    end
+    headers.uniq
+  end
+
+  need_append_framework_dependency_pods = lambda do |pod_target|
+    return unless config = need_append_framework_dependency[pod_target.name]
+    # use true to represent all dependency
+    included_targets = case config
+                       when true then pod_target.recursive_dependent_targets
+                       when Hash then
+                         pod_targets_by_name.values_at(*config[:recursive]).compact.flatten(1)
+                           .flat_map {|pt| [pt] + pt.recursive_dependent_targets}
+                           .uniq
+                       when Array then
+                         pod_targets_by_name.values_at(*config).compact.flatten(1)
+                       else
+                         raise "unsupported"
+                       end
+    return nil if included_targets.empty?
+
+    pt_build_settings = lambda do |pod_target|
+      pod_target.build_settings[:release]
+    end
+
+    headers = []
+    # @param pt [Pod::PodTarget]
+    included_targets.each do |pt|
+      headers.push "\"${PODS_CONFIGURATION_BUILD_DIR}/#{pt.pod_name}\""
+    end
+    headers.uniq
+  end
+
+  installer.pod_targets.each do |pod_target|
+    attributes_hash = pod_target.root_spec.attributes_hash
+    pod_target_xcconfig = (attributes_hash['pod_target_xcconfig'] ||= {})
+    # 这些常用flag给予默认值，让后面不用判断和设置默认值
+    pod_target_xcconfig['WARNING_CFLAGS'] ||= ''
+    pod_target_xcconfig['OTHER_SWIFT_FLAGS'] ||= ''
+    pod_target_xcconfig['OTHER_CFLAGS'] ||= ''
+    pod_target_xcconfig['OTHER_LDFLAGS'] ||= ''
+    pod_target_xcconfig['GCC_PREPROCESSOR_DEFINITIONS'] ||= ''
+    pod_target_xcconfig['SWIFT_ACTIVE_COMPILATION_CONDITIONS'] ||= '$(inherited)'
+
+    pod_target_xcconfig['SWIFT_INCLUDE_PATHS'] ||= ''
+    pod_target_xcconfig['SWIFT_VERSION'] = '5.5'
+
+    pod_target_xcconfig['WARNING_CFLAGS'] += ' -Wno-nullability-completeness -Wno-nonnull -Wno-incomplete-umbrella'
+    pod_target_xcconfig['OTHER_SWIFT_FLAGS'] += ' -Xcc -Wno-nullability-completeness -Xcc -Wno-nonnull -Xcc -Wno-incomplete-umbrella'
+
+    if fix_modular_include.include? pod_target.name
+      pod_target_xcconfig['CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES'] = "YES"
+      # CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES 只对 objc 生效，swift 需要额外参数禁掉 error
+      pod_target_xcconfig['OTHER_SWIFT_FLAGS'] += ' -Xcc -Wno-error=non-modular-include-in-framework-module'
+    end
+
+    if system_header_paths = header_search_paths_of_pods[pod_target]
+      pod_target_xcconfig['SYSTEM_HEADER_SEARCH_PATHS'] = system_header_paths.join(' ')
+    end
+    if framework_header_paths = need_append_framework_dependency_pods[pod_target]
+      pod_target_xcconfig['FRAMEWORK_SEARCH_PATHS'] = framework_header_paths.join(' ')
+    end
+  end
+end
+
 post_install do |installer|
-  installer.pods_project.targets.each do |target|
-    flutter_additional_ios_build_settings(target)
+#  puts "generated_projects = \n#{installer.generated_projects}\n"
+#  puts "generated_pod_targets = \n#{installer.generated_pod_targets}\n"
+#  puts "pod_targets = \n#{installer.pod_targets}\n"
+#  puts "pods_project = \n#{installer.pods_project}\n"
+
+  # 以下 hooks 需要 --clean-install 后才会重新奏效，否则会直接读 Pods 缓存
+  installer.generated_projects.each do |project|
+    # 删除所有 Target 的自有配置
+    project.targets.each do |target|
+      flutter_additional_ios_build_settings(target)
+
+      target.build_configurations.each do |config|
+        config.build_settings.delete 'IPHONEOS_DEPLOYMENT_TARGET'
+        config.build_settings.delete 'CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER'
+
+        # 针对 FlutteTools 2.10，校正配置，避免全指令架构导致编译过慢
+        config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES' if config.type == :debug
+        config.build_settings['VALID_ARCHS[sdk=iphonesimulator*]'] = '$(ARCHS_STANDARD)'
+        config.build_settings['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = '$(inherited) i386'
+      end
+      # permission_handler
+      if target.name == 'meego_permission_handler'
+        target.build_configurations.each do |config|
+          config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= [
+            '$(inherited)',
+            ## dart: PermissionGroup.photos
+            'PERMISSION_PHOTOS=1',
+          ]
+        end
+      end
+    end
+
+    # 将自定义配置写入 Project，使得 Targets 全部继承 Project 的配置
+    project.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+
+      # Fix warning:  Double-quoted include 'xxxx.h'
+      config.build_settings['CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER'] = 'NO'
+    end
+
+    # 由于目前使用的 use_frameworks!
+    # 但有部分二方三方库在该模式下存在 Project 和 Private 配置的文件引用，
+    # 这将导致类符号不能被外部静态库所正常导入，故这里要对文件权限进行统一露出
+    # 将 project build phases 里的 .h 强制挪到 public 里去
+    # target.class = Xcodeproj::Project::Object::PBXNativeTarget
+    project.targets.each do |target|
+      if target.class == Xcodeproj::Project::Object::PBXNativeTarget && !(no_need_public_hook_modules.include? target.name)
+        # headers_build_phase.class = Class: Xcodeproj::Project::Object::PBXHeadersBuildPhase
+        target.headers_build_phase.files_references.each do |ref|
+          # ref.class = Xcodeproj::Project::Object::PBXFileReference
+          ref.build_files.each do |file|
+            # file.class = Xcodeproj::Project::Object::PBXBuildFile
+            if !file.settings.nil? && !(file.settings['ATTRIBUTES'].include? "Public")
+              puts "由于启用了 use_frameworks!，权限为 #{file.settings['ATTRIBUTES']} 的 #{file.display_name} 被强制转为 Public！"
+              file.settings['ATTRIBUTES'] = ['Public']
+            end
+          end
+        end
+      end
+    end
+  end
+
+  installer.generated_pod_targets.each do |pod_target|
+    attributes_hash = pod_target.root_spec.attributes_hash
+    pod_target_xcconfig = (attributes_hash['pod_target_xcconfig'] ||= {})
+
+    pod_target_xcconfig['SWIFT_VERSION'] = '5.3'
+    pod_target_xcconfig['WARNING_CFLAGS'] ||= ''
+    pod_target_xcconfig['WARNING_CFLAGS'] += ' -Wno-nullability-completeness -Wno-nonnull -Wno-incomplete-umbrella'
+    pod_target_xcconfig['OTHER_SWIFT_FLAGS'] ||= ''
+    pod_target_xcconfig['OTHER_SWIFT_FLAGS'] += ' -Xcc -Wno-nullability-completeness -Xcc -Wno-nonnull -Xcc -Wno-incomplete-umbrella'
   end
 end
